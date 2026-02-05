@@ -18,6 +18,7 @@ import {
   STORE_DIR,
   TIMEZONE,
   TRIGGER_PATTERN,
+  DISCORD_TOKEN
 } from './config.js';
 import {
   AvailableGroup,
@@ -35,13 +36,17 @@ import {
   initDatabase,
   setLastGroupSync,
   storeChatMetadata,
+  storeDiscordMessage,
   storeMessage,
   updateChatName,
+  getSetting,
+  setSetting
 } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup, Session } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
+import { startDiscord, sendDiscordMessage, setDiscordTyping, type DiscordIncomingMessage } from './discord.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -56,6 +61,13 @@ let lidToPhoneMap: Record<string, string> = {};
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let groupSyncTimerStarted = false;
+
+const DISCORD_GROUP: RegisteredGroup = {
+  name: 'Discord',
+  folder: 'discord',
+  trigger: '@mention',
+  added_at: new Date().toISOString()
+};
 
 /**
  * Translate a JID from LID format to phone format if we have a mapping.
@@ -74,6 +86,11 @@ function translateJid(jid: string): string {
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   try {
+    if (jid.startsWith('discord:')) {
+      await setDiscordTyping(jid, isTyping);
+      return;
+    }
+
     await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
   } catch (err) {
     logger.debug({ jid, err }, 'Failed to update typing status');
@@ -224,6 +241,72 @@ async function processMessage(msg: NewMessage): Promise<void> {
   }
 }
 
+async function processDiscordIncoming(msg: DiscordIncomingMessage): Promise<void> {
+  // Handle admin commands (hot-swappable settings)
+  const commandMatch = msg.content.match(/^!runtime\s+(claude|codex|status)$/i);
+  if (commandMatch) {
+    const cmd = commandMatch[1].toLowerCase();
+    if (cmd === 'status') {
+      const current = getSetting('agent_runtime') || 'claude (default)';
+      await sendMessage(msg.scopeId, `🔧 Current runtime: **${current}**`);
+    } else {
+      setSetting('agent_runtime', cmd);
+      logger.info({ runtime: cmd, user: msg.authorName }, 'Runtime switched via command');
+      await sendMessage(msg.scopeId, `✅ Runtime switched to **${cmd}**. Next message will use ${cmd === 'codex' ? 'Codex CLI' : 'Claude Agent SDK'}.`);
+    }
+    return; // Don't process as normal message
+  }
+
+  // Persist chat + message
+  storeChatMetadata(msg.scopeId, msg.timestamp, msg.channelName ? `discord:${msg.channelName}` : msg.scopeId);
+  storeDiscordMessage({
+    id: msg.id,
+    chatJid: msg.scopeId,
+    senderId: msg.authorId,
+    senderName: msg.authorName,
+    content: msg.content,
+    timestamp: msg.timestamp,
+    isFromMe: false
+  });
+
+  // Respond to all messages in allowed channels (no @mention required)
+  // The isAllowed check in discord.ts already filters to main channel + allowlisted channels
+  const shouldRespond = true;
+  if (!shouldRespond) return;
+
+  const sinceTimestamp = lastAgentTimestamp[msg.scopeId] || '';
+  const prompt = buildPromptFromMessages(msg.scopeId, sinceTimestamp);
+  if (!prompt) return;
+
+  const isMain = msg.isMainChannel;
+
+  logger.info({ scopeId: msg.scopeId, isMain, isDM: msg.isDM }, 'Processing Discord message');
+
+  await setTyping(msg.scopeId, true);
+  const response = await runAgent(DISCORD_GROUP, prompt, msg.scopeId);
+  await setTyping(msg.scopeId, false);
+
+  if (response) {
+    lastAgentTimestamp[msg.scopeId] = msg.timestamp;
+    await sendMessage(msg.scopeId, `${ASSISTANT_NAME}: ${response}`);
+  }
+}
+
+function buildPromptFromMessages(chatJid: string, sinceTimestamp: string): string {
+  const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+
+  const lines = missedMessages.map(m => {
+    const escapeXml = (s: string) => s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
+  });
+
+  return `<messages>\n${lines.join('\n')}\n</messages>`;
+}
+
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
@@ -288,6 +371,12 @@ async function runAgent(
 
 async function sendMessage(jid: string, text: string): Promise<void> {
   try {
+    if (jid.startsWith('discord:')) {
+      await sendDiscordMessage(jid, text);
+      logger.info({ jid, length: text.length }, 'Discord message sent');
+      return;
+    }
+
     await sock.sendMessage(jid, { text });
     logger.info({ jid, length: text.length }, 'Message sent');
   } catch (err) {
@@ -319,6 +408,7 @@ function startIpcWatcher(): void {
       return;
     }
 
+    // Process tasks/messages for each group
     for (const sourceGroup of groupFolders) {
       const isMain = sourceGroup === MAIN_GROUP_FOLDER;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
@@ -339,7 +429,8 @@ function startIpcWatcher(): void {
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
+                  (targetGroup && targetGroup.folder === sourceGroup) ||
+                  data.chatJid.startsWith('discord:')
                 ) {
                   await sendMessage(
                     data.chatJid,
@@ -465,9 +556,19 @@ async function processTaskIpc(
         }
 
         // Resolve the correct JID for the target group (don't trust IPC payload)
-        const targetJid = Object.entries(registeredGroups).find(
+        // First try registered WhatsApp groups
+        let targetJid = Object.entries(registeredGroups).find(
           ([, group]) => group.folder === targetGroup,
         )?.[0];
+
+        // Fallback: If no registered group found, check if it's the Discord folder
+        // This allows scheduling tasks for Discord even if there's no "registered" JID in the traditional sense
+        // (though tasks usually require a specific JID to reply to, this at least allows the task to be created)
+        if (!targetJid && targetGroup === DISCORD_GROUP.folder) {
+           // We can't easily resolve a default channel ID here without looking up recent messages
+           // For now, fail safe if not explicit
+           logger.warn({ targetGroup }, 'Cannot resolve Discord target JID for scheduled task');
+        }
 
         if (!targetJid) {
           logger.warn(
@@ -839,7 +940,29 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
-  await connectWhatsApp();
+
+  if (DISCORD_TOKEN) {
+    await startDiscord({
+      onIncomingMessage: processDiscordIncoming,
+      logger
+    });
+  } else {
+    logger.info('Discord disabled (DISCORD_TOKEN not set)');
+  }
+
+  // WhatsApp is optional - only connect if auth exists
+  const authDir = path.join(STORE_DIR, 'auth');
+  const authFiles = fs.existsSync(authDir) ? fs.readdirSync(authDir) : [];
+  if (authFiles.length > 0) {
+    await connectWhatsApp();
+  } else {
+    logger.info('WhatsApp disabled (no auth credentials)');
+    // Keep process alive for Discord
+    if (!DISCORD_TOKEN) {
+      logger.error('No channels configured - exiting');
+      process.exit(1);
+    }
+  }
 }
 
 main().catch((err) => {

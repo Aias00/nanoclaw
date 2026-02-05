@@ -13,10 +13,14 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  AGENT_RUNTIME,
+  type AgentRuntime,
 } from './config.js';
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { runCodexAgent } from './codex-runner.js';
+import { getSetting } from './db.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -39,6 +43,18 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+}
+
+function getAgentRuntime(group: RegisteredGroup): AgentRuntime {
+  // Priority: per-group config > database setting > env var > default
+  const groupRuntime = group.containerConfig?.env?.AGENT_RUNTIME as AgentRuntime | undefined;
+  if (groupRuntime) return groupRuntime;
+
+  // Hot-swappable: check database setting
+  const dbRuntime = getSetting('agent_runtime') as AgentRuntime | null;
+  if (dbRuntime && (dbRuntime === 'claude' || dbRuntime === 'codex')) return dbRuntime;
+
+  return AGENT_RUNTIME || 'claude';
 }
 
 export interface ContainerOutput {
@@ -190,6 +206,23 @@ export async function runContainerAgent(
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+
+  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
+  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+
+  const runtime = getAgentRuntime(group);
+
+  // If configured, run Codex CLI directly (no Claude Agent SDK).
+  if (runtime === 'codex') {
+    logger.info({ group: group.name, isMain: input.isMain, cwd: groupDir }, 'Running Codex runtime');
+
+    // Bind environment expected by Codex runner
+    process.env.NANOCLAW_GROUP_DIR = groupDir;
+    process.env.NANOCLAW_IPC_DIR = groupIpcDir;
+
+    return await runCodexAgent(group, input);
+  }
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const containerArgs = buildContainerArgs(mounts);
