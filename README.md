@@ -123,6 +123,17 @@ Key files:
 - `src/db.ts` - SQLite operations
 - `groups/*/CLAUDE.md` - Per-group memory
 
+**Want to dive deeper?** See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for complete system design documentation.
+
+## Documentation
+
+- **[Documentation Index](docs/INDEX.md)** - Complete documentation overview
+- **[Architecture Guide](docs/ARCHITECTURE.md)** - System design and data flow
+- **[Developer Guide](docs/DEVELOPER_GUIDE.md)** - Development workflows and tutorials
+- **[API Reference](docs/API.md)** - Function signatures and interfaces
+- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+- **[Security Model](docs/SECURITY.md)** - Security architecture and best practices
+
 ## FAQ
 
 **Why WhatsApp and not Telegram/Signal/etc?**
