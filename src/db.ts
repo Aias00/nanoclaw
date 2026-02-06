@@ -60,6 +60,11 @@ export function initDatabase(): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 
   // Add sender_name column if it doesn't exist (migration for existing DBs)
@@ -393,4 +398,70 @@ export function getTaskRunLogs(taskId: string, limit = 10): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
+}
+
+/**
+ * Store Discord message to database.
+ */
+export function storeDiscordMessage(params: {
+  id: string;
+  chatJid: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  timestamp: string;
+  isFromMe: boolean;
+}): void {
+  db.prepare(
+    `
+    INSERT OR IGNORE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `,
+  ).run(
+    params.id,
+    params.chatJid,
+    params.senderId,
+    params.senderName,
+    params.content,
+    params.timestamp,
+    params.isFromMe ? 1 : 0,
+  );
+}
+
+/**
+ * Get a setting value from the database.
+ */
+export function getSetting(key: string): string | null {
+  const result = db
+    .prepare(
+      `
+    SELECT value FROM settings WHERE key = ?
+  `,
+    )
+    .get(key) as { value: string } | undefined;
+
+  return result?.value || null;
+}
+
+/**
+ * Set a setting value in the database.
+ */
+export function setSetting(key: string, value: string): void {
+  db.prepare(
+    `
+    INSERT OR REPLACE INTO settings (key, value)
+    VALUES (?, ?)
+  `,
+  ).run(key, value);
+}
+
+/**
+ * Delete a setting from the database.
+ */
+export function deleteSetting(key: string): void {
+  db.prepare(
+    `
+    DELETE FROM settings WHERE key = ?
+  `,
+  ).run(key);
 }

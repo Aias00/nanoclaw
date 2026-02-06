@@ -1,8 +1,8 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Apple Container or Docker and handles IPC
  */
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -25,6 +25,33 @@ import { getSetting } from './db.js';
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// Auto-detect container runtime
+let CONTAINER_RUNTIME: 'container' | 'docker' | null = null;
+
+function detectContainerRuntime(): 'container' | 'docker' {
+  if (CONTAINER_RUNTIME) return CONTAINER_RUNTIME;
+
+  try {
+    execSync('container --version', { stdio: 'ignore' });
+    CONTAINER_RUNTIME = 'container';
+    logger.info('Using Apple Container runtime');
+    return 'container';
+  } catch {
+    // container command not found, try docker
+  }
+
+  try {
+    execSync('docker --version', { stdio: 'ignore' });
+    CONTAINER_RUNTIME = 'docker';
+    logger.info('Using Docker runtime');
+    return 'docker';
+  } catch {
+    // docker command not found
+  }
+
+  throw new Error('No container runtime found. Please install Apple Container or Docker.');
+}
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -178,18 +205,29 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[]): string[] {
+function buildContainerArgs(mounts: VolumeMount[], runtime: 'container' | 'docker'): string[] {
   const args: string[] = ['run', '-i', '--rm'];
 
-  // Apple Container: --mount for readonly, -v for read-write
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push(
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-      );
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+  if (runtime === 'container') {
+    // Apple Container: --mount for readonly, -v for read-write
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push(
+          '--mount',
+          `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+        );
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
+    }
+  } else {
+    // Docker: -v with :ro suffix for readonly
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
     }
   }
 
@@ -224,8 +262,11 @@ export async function runContainerAgent(
     return await runCodexAgent(group, input);
   }
 
+  // Detect container runtime (Apple Container or Docker)
+  const containerRuntime = detectContainerRuntime();
+
   const mounts = buildVolumeMounts(group, input.isMain);
-  const containerArgs = buildContainerArgs(mounts);
+  const containerArgs = buildContainerArgs(mounts, containerRuntime);
 
   logger.debug(
     {
@@ -252,7 +293,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn(containerRuntime, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
