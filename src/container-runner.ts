@@ -1,8 +1,8 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container or Docker and handles IPC
+ * Spawns agent execution in Apple Container and handles IPC
  */
-import { spawn, execSync } from 'child_process';
+import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,45 +13,14 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
-  AGENT_RUNTIME,
-  type AgentRuntime,
 } from './config.js';
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
-import { runCodexAgent } from './codex-runner.js';
-import { getSetting } from './db.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-
-// Auto-detect container runtime
-let CONTAINER_RUNTIME: 'container' | 'docker' | null = null;
-
-function detectContainerRuntime(): 'container' | 'docker' {
-  if (CONTAINER_RUNTIME) return CONTAINER_RUNTIME;
-
-  try {
-    execSync('container --version', { stdio: 'ignore' });
-    CONTAINER_RUNTIME = 'container';
-    logger.info('Using Apple Container runtime');
-    return 'container';
-  } catch {
-    // container command not found, try docker
-  }
-
-  try {
-    execSync('docker --version', { stdio: 'ignore' });
-    CONTAINER_RUNTIME = 'docker';
-    logger.info('Using Docker runtime');
-    return 'docker';
-  } catch {
-    // docker command not found
-  }
-
-  throw new Error('No container runtime found. Please install Apple Container or Docker.');
-}
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -72,18 +41,6 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
 }
 
-function getAgentRuntime(group: RegisteredGroup): AgentRuntime {
-  // Priority: per-group config > database setting > env var > default
-  const groupRuntime = group.containerConfig?.env?.AGENT_RUNTIME as AgentRuntime | undefined;
-  if (groupRuntime) return groupRuntime;
-
-  // Hot-swappable: check database setting
-  const dbRuntime = getSetting('agent_runtime') as AgentRuntime | null;
-  if (dbRuntime && (dbRuntime === 'claude' || dbRuntime === 'codex')) return dbRuntime;
-
-  return AGENT_RUNTIME || 'claude';
-}
-
 export interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
@@ -94,7 +51,7 @@ export interface ContainerOutput {
 interface VolumeMount {
   hostPath: string;
   containerPath: string;
-  readonly?: boolean;
+  readonly: boolean;
 }
 
 function buildVolumeMounts(
@@ -148,6 +105,39 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  const settingsFile = path.join(groupSessionsDir, 'settings.json');
+  if (!fs.existsSync(settingsFile)) {
+    fs.writeFileSync(settingsFile, JSON.stringify({
+      env: {
+        // Enable agent swarms (subagent orchestration)
+        // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+        // Load CLAUDE.md from additional mounted directories
+        // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+        // Enable Claude's memory feature (persists user preferences between sessions)
+        // https://code.claude.com/docs/en/memory#manage-auto-memory
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+      },
+    }, null, 2) + '\n');
+  }
+
+  // Sync skills from container/skills/ into each group's .claude/skills/
+  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const skillsDst = path.join(groupSessionsDir, 'skills');
+  if (fs.existsSync(skillsSrc)) {
+    for (const skillDir of fs.readdirSync(skillsSrc)) {
+      const srcDir = path.join(skillsSrc, skillDir);
+      if (!fs.statSync(srcDir).isDirectory()) continue;
+      const dstDir = path.join(skillsDst, skillDir);
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const file of fs.readdirSync(srcDir)) {
+        const srcFile = path.join(srcDir, file);
+        const dstFile = path.join(dstDir, file);
+        fs.copyFileSync(srcFile, dstFile);
+      }
+    }
+  }
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
@@ -159,6 +149,7 @@ function buildVolumeMounts(
   const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -192,6 +183,15 @@ function buildVolumeMounts(
     }
   }
 
+  // Mount agent-runner source from host — recompiled on container startup.
+  // Bypasses Apple Container's sticky build cache for code changes.
+  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
+  mounts.push({
+    hostPath: agentRunnerSrc,
+    containerPath: '/app/src',
+    readonly: true,
+  });
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -205,29 +205,18 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[], runtime: 'container' | 'docker'): string[] {
-  const args: string[] = ['run', '-i', '--rm'];
+function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
+  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  if (runtime === 'container') {
-    // Apple Container: --mount for readonly, -v for read-write
-    for (const mount of mounts) {
-      if (mount.readonly) {
-        args.push(
-          '--mount',
-          `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-        );
-      } else {
-        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
-      }
-    }
-  } else {
-    // Docker: -v with :ro suffix for readonly
-    for (const mount of mounts) {
-      if (mount.readonly) {
-        args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
-      } else {
-        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
-      }
+  // Apple Container: --mount for readonly, -v for read-write
+  for (const mount of mounts) {
+    if (mount.readonly) {
+      args.push(
+        '--mount',
+        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+      );
+    } else {
+      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
     }
   }
 
@@ -239,38 +228,23 @@ function buildContainerArgs(mounts: VolumeMount[], runtime: 'container' | 'docke
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-
-  const runtime = getAgentRuntime(group);
-
-  // If configured, run Codex CLI directly (no Claude Agent SDK).
-  if (runtime === 'codex') {
-    logger.info({ group: group.name, isMain: input.isMain, cwd: groupDir }, 'Running Codex runtime');
-
-    // Bind environment expected by Codex runner
-    process.env.NANOCLAW_GROUP_DIR = groupDir;
-    process.env.NANOCLAW_IPC_DIR = groupIpcDir;
-
-    return await runCodexAgent(group, input);
-  }
-
-  // Detect container runtime (Apple Container or Docker)
-  const containerRuntime = detectContainerRuntime();
-
   const mounts = buildVolumeMounts(group, input.isMain);
-  const containerArgs = buildContainerArgs(mounts, containerRuntime);
+  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+  const containerArgs = buildContainerArgs(mounts, containerName);
 
   logger.debug(
     {
       group: group.name,
+      containerName,
       mounts: mounts.map(
         (m) =>
           `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
@@ -283,6 +257,7 @@ export async function runContainerAgent(
   logger.info(
     {
       group: group.name,
+      containerName,
       mountCount: mounts.length,
       isMain: input.isMain,
     },
@@ -293,31 +268,74 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn(containerRuntime, containerArgs, {
+    const container = spawn('container', containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    onProcess(container, containerName);
 
     let stdout = '';
     let stderr = '';
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
+    // Write input and close stdin (Apple Container doesn't flush pipe without EOF)
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
 
+    // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
+    let parseBuffer = '';
+    let newSessionId: string | undefined;
+    let outputChain = Promise.resolve();
+
     container.stdout.on('data', (data) => {
-      if (stdoutTruncated) return;
       const chunk = data.toString();
-      const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
-      if (chunk.length > remaining) {
-        stdout += chunk.slice(0, remaining);
-        stdoutTruncated = true;
-        logger.warn(
-          { group: group.name, size: stdout.length },
-          'Container stdout truncated due to size limit',
-        );
-      } else {
-        stdout += chunk;
+
+      // Always accumulate for logging
+      if (!stdoutTruncated) {
+        const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
+        if (chunk.length > remaining) {
+          stdout += chunk.slice(0, remaining);
+          stdoutTruncated = true;
+          logger.warn(
+            { group: group.name, size: stdout.length },
+            'Container stdout truncated due to size limit',
+          );
+        } else {
+          stdout += chunk;
+        }
+      }
+
+      // Stream-parse for output markers
+      if (onOutput) {
+        parseBuffer += chunk;
+        let startIdx: number;
+        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+          if (endIdx === -1) break; // Incomplete pair, wait for more data
+
+          const jsonStr = parseBuffer
+            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .trim();
+          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+
+          try {
+            const parsed: ContainerOutput = JSON.parse(jsonStr);
+            if (parsed.newSessionId) {
+              newSessionId = parsed.newSessionId;
+            }
+            // Activity detected — reset the hard timeout
+            resetTimeout();
+            // Call onOutput for all markers (including null results)
+            // so idle timers start even for "silent" query completions.
+            outputChain = outputChain.then(() => onOutput(parsed));
+          } catch (err) {
+            logger.warn(
+              { group: group.name, error: err },
+              'Failed to parse streamed output chunk',
+            );
+          }
+        }
       }
     });
 
@@ -327,6 +345,8 @@ export async function runContainerAgent(
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
       }
+      // Don't reset timeout on stderr — SDK writes debug logs continuously.
+      // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
       if (stderrTruncated) return;
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
       if (chunk.length > remaining) {
@@ -341,24 +361,60 @@ export async function runContainerAgent(
       }
     });
 
-    const timeout = setTimeout(() => {
-      logger.error({ group: group.name }, 'Container timeout, killing');
-      container.kill('SIGKILL');
-      resolve({
-        status: 'error',
-        result: null,
-        error: `Container timed out after ${CONTAINER_TIMEOUT}ms`,
+    let timedOut = false;
+    const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+
+    const killOnTimeout = () => {
+      timedOut = true;
+      logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
+      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+        if (err) {
+          logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
+          container.kill('SIGKILL');
+        }
       });
-    }, group.containerConfig?.timeout || CONTAINER_TIMEOUT);
+    };
+
+    let timeout = setTimeout(killOnTimeout, timeoutMs);
+
+    // Reset the timeout whenever there's activity (streaming output)
+    const resetTimeout = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(killOnTimeout, timeoutMs);
+    };
 
     container.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
+      if (timedOut) {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const timeoutLog = path.join(logsDir, `container-${ts}.log`);
+        fs.writeFileSync(timeoutLog, [
+          `=== Container Run Log (TIMEOUT) ===`,
+          `Timestamp: ${new Date().toISOString()}`,
+          `Group: ${group.name}`,
+          `Container: ${containerName}`,
+          `Duration: ${duration}ms`,
+          `Exit Code: ${code}`,
+        ].join('\n'));
+
+        logger.error(
+          { group: group.name, containerName, duration, code },
+          'Container timed out',
+        );
+
+        resolve({
+          status: 'error',
+          result: null,
+          error: `Container timed out after ${group.containerConfig?.timeout || CONTAINER_TIMEOUT}ms`,
+        });
+        return;
+      }
+
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const logFile = path.join(logsDir, `container-${timestamp}.log`);
-      const isVerbose =
-        process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
+      const isVerbose = process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
 
       const logLines = [
         `=== Container Run Log ===`,
@@ -372,7 +428,9 @@ export async function runContainerAgent(
         ``,
       ];
 
-      if (isVerbose) {
+      const isError = code !== 0;
+
+      if (isVerbose || isError) {
         logLines.push(
           `=== Input ===`,
           JSON.stringify(input, null, 2),
@@ -406,14 +464,6 @@ export async function runContainerAgent(
             .join('\n'),
           ``,
         );
-
-        if (code !== 0) {
-          logLines.push(
-            `=== Stderr (last 500 chars) ===`,
-            stderr.slice(-500),
-            ``,
-          );
-        }
       }
 
       fs.writeFileSync(logFile, logLines.join('\n'));
@@ -425,7 +475,8 @@ export async function runContainerAgent(
             group: group.name,
             code,
             duration,
-            stderr: stderr.slice(-500),
+            stderr,
+            stdout,
             logFile,
           },
           'Container exited with error',
@@ -439,6 +490,23 @@ export async function runContainerAgent(
         return;
       }
 
+      // Streaming mode: wait for output chain to settle, return completion marker
+      if (onOutput) {
+        outputChain.then(() => {
+          logger.info(
+            { group: group.name, duration, newSessionId },
+            'Container completed (streaming mode)',
+          );
+          resolve({
+            status: 'success',
+            result: null,
+            newSessionId,
+          });
+        });
+        return;
+      }
+
+      // Legacy mode: parse the last output marker pair from accumulated stdout
       try {
         // Extract JSON between sentinel markers for robust parsing
         const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
@@ -472,7 +540,8 @@ export async function runContainerAgent(
         logger.error(
           {
             group: group.name,
-            stdout: stdout.slice(-500),
+            stdout,
+            stderr,
             error: err,
           },
           'Failed to parse container output',
@@ -488,7 +557,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
-      logger.error({ group: group.name, error: err }, 'Container spawn error');
+      logger.error({ group: group.name, containerName, error: err }, 'Container spawn error');
       resolve({
         status: 'error',
         result: null,
