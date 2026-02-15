@@ -28,6 +28,6 @@ groups/global/*
 # IDE
 .idea/
 .vscode/
-.vibe/
+.vibe/*
 
 agents-sdk-docs
