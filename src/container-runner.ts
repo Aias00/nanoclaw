@@ -1,8 +1,8 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Apple Container, Docker, Tart VM, or Vibe VM
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,14 +13,87 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  AGENT_RUNTIME,
+  type AgentRuntime,
 } from './config.js';
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { runCodexAgent } from './codex-runner.js';
+import { runOpenCodeAgent } from './opencode-runner.js';
+import { runTartAgent } from './tart-runner.js';
+import { checkTartDependencies } from './tart-ssh-helper.js';
+import { runVibeAgent } from './vibe-runner.js';
+import { checkVibeDependency } from './vibe-helper.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// Auto-detect container runtime
+let CONTAINER_RUNTIME: 'container' | 'docker' | 'tart' | 'vibe' | null = null;
+
+function detectContainerRuntime(): 'container' | 'docker' | 'tart' | 'vibe' {
+  if (CONTAINER_RUNTIME) return CONTAINER_RUNTIME;
+
+  // Allow manual override via environment variable
+  const manualRuntime = process.env.CONTAINER_RUNTIME;
+  if (manualRuntime === 'tart' || manualRuntime === 'container' || manualRuntime === 'docker' || manualRuntime === 'vibe') {
+    CONTAINER_RUNTIME = manualRuntime;
+    logger.info({ runtime: manualRuntime }, 'Using manually configured container runtime');
+    return manualRuntime;
+  }
+
+  // 1. Try Apple Container (macOS native, lightweight)
+  try {
+    execSync('container --version', { stdio: 'ignore' });
+    CONTAINER_RUNTIME = 'container';
+    logger.info('Using Apple Container runtime');
+    return 'container';
+  } catch {
+    // container command not found, try next
+  }
+
+  // 2. Try Tart (macOS Virtualization.framework, VM-level isolation)
+  try {
+    const deps = checkTartDependencies();
+    if (deps.tart && deps.sshpass) {
+      CONTAINER_RUNTIME = 'tart';
+      logger.info('Using Tart runtime');
+      return 'tart';
+    } else {
+      if (!deps.tart) logger.debug('Tart not found');
+      if (!deps.sshpass) logger.debug('sshpass not found (required for Tart)');
+    }
+  } catch {
+    // tart or sshpass not found, try next
+  }
+
+  // 3. Try Vibe (Linux VM, persistent)
+  try {
+    if (checkVibeDependency()) {
+      CONTAINER_RUNTIME = 'vibe';
+      logger.info('Using Vibe runtime');
+      return 'vibe';
+    } else {
+      logger.debug('Vibe not found');
+    }
+  } catch {
+    // vibe not found, try next
+  }
+
+  // 4. Fallback to Docker
+  try {
+    execSync('docker --version', { stdio: 'ignore' });
+    CONTAINER_RUNTIME = 'docker';
+    logger.info('Using Docker runtime');
+    return 'docker';
+  } catch {
+    // docker command not found
+  }
+
+  throw new Error('No container runtime found. Please install Apple Container, Tart (with sshpass), Vibe, or Docker.');
+}
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -163,7 +236,7 @@ function buildVolumeMounts(
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -205,18 +278,34 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+function buildContainerArgs(mounts: VolumeMount[], containerName: string, runtime: 'container' | 'docker'): string[] {
+  const args: string[] = ['run', '-i', '--rm'];
 
-  // Apple Container: --mount for readonly, -v for read-write
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push(
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-      );
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+  if (runtime === 'container') {
+    args.push('--name', containerName);
+  }
+
+  if (runtime === 'container') {
+    // Apple Container: --mount for readonly, -v for read-write
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push(
+          '--mount',
+          `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+        );
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
+    }
+  } else {
+    // Docker: -v always, use :ro suffix for readonly
+    // Docker doesn't support --name in the same way for transient containers if reused
+    for (const mount of mounts) {
+      args.push('-v', `${mount.hostPath}:${mount.containerPath}${mount.readonly ? ':ro' : ''}`);
+    }
+    // For Docker, we need to handle host networking for local API access
+    if (process.env.ANTHROPIC_BASE_URL?.includes('localhost') || process.env.ANTHROPIC_BASE_URL?.includes('127.0.0.1')) {
+      args.push('--add-host', 'host.docker.internal:host-gateway');
     }
   }
 
@@ -225,26 +314,94 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   return args;
 }
 
-export async function runContainerAgent(
+/**
+ * Main entry point for running an agent.
+ * Routes to the configured runtime (OpenCode, Codex, Claude SDK)
+ * and container environment (Apple Container, Docker, Tart, Vibe).
+ */
+export async function runAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
-  const startTime = Date.now();
-
   const groupDir = path.join(GROUPS_DIR, group.folder);
+  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  // Determine runtime based on config or DB override
+  // Priority: DB setting > Env var > Default (claude)
+  // This allows per-group runtime overrides if implemented
+  let runtime = AGENT_RUNTIME;
+
+  // Example: check if group has specific runtime config (future feature)
+  // const dbRuntime = getSetting(`group:${group.folder}:runtime`);
+  // if (dbRuntime && (dbRuntime === 'claude' || dbRuntime === 'codex' || dbRuntime === 'opencode')) return dbRuntime;
+
+  // If configured, run Codex CLI directly (no container overhead for now)
+  if (runtime === 'codex') {
+    logger.info({ group: group.name, isMain: input.isMain, cwd: groupDir }, 'Running Codex runtime');
+
+    // Bind environment expected by Codex runner
+    process.env.NANOCLAW_GROUP_DIR = groupDir;
+    process.env.NANOCLAW_IPC_DIR = groupIpcDir;
+
+    return await runCodexAgent(group, input);
+  }
+
+  // If configured, run OpenCode CLI directly (no Claude Agent SDK).
+  if (runtime === 'opencode') {
+    logger.info({ group: group.name, isMain: input.isMain, cwd: groupDir }, 'Running OpenCode runtime');
+
+    // Bind environment expected by OpenCode runner
+    process.env.NANOCLAW_GROUP_DIR = groupDir;
+    process.env.NANOCLAW_IPC_DIR = groupIpcDir;
+
+    return await runOpenCodeAgent(group, input);
+  }
+
+  // Detect container runtime (Apple Container, Tart, Vibe, or Docker)
+  const containerRuntime = detectContainerRuntime();
+
+  // If Tart is selected, use VM-based execution
+  if (containerRuntime === 'tart') {
+    logger.info({ group: group.name, isMain: input.isMain }, 'Running Tart VM runtime');
+    return await runTartAgent(group, input);
+  }
+
+  // If Vibe is selected, use persistent Linux VM execution
+  if (containerRuntime === 'vibe') {
+    logger.info({ group: group.name, isMain: input.isMain }, 'Running Vibe VM runtime');
+    return await runVibeAgent(group, input);
+  }
+
+  // Otherwise, use Apple Container or Docker
+  // This runs the standard agent-runner container
+  return await runContainerAgent(group, input, onProcess, onOutput, containerRuntime);
+}
+
+// Internal function for running the standard container agent
+async function runContainerAgent(
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onOutput: ((output: ContainerOutput) => Promise<void>) | undefined,
+  runtime: 'container' | 'docker'
+): Promise<ContainerOutput> {
+  const startTime = Date.now();
+  const groupDir = path.join(GROUPS_DIR, group.folder);
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, runtime);
 
   logger.debug(
     {
       group: group.name,
       containerName,
+      runtime,
       mounts: mounts.map(
         (m) =>
           `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
@@ -258,6 +415,7 @@ export async function runContainerAgent(
     {
       group: group.name,
       containerName,
+      runtime,
       mountCount: mounts.length,
       isMain: input.isMain,
     },
@@ -268,7 +426,8 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    // Use 'container' or 'docker' command based on runtime
+    const container = spawn(runtime, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -367,7 +526,7 @@ export async function runContainerAgent(
     const killOnTimeout = () => {
       timedOut = true;
       logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      exec(`${runtime} stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');

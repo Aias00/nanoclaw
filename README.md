@@ -47,11 +47,14 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 ## What It Supports
 
 - **WhatsApp I/O** - Message Claude from your phone
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
+- **Discord & Twitter** - Multi-platform support for Discord and X/Twitter
+- **Multiple AI Runtimes** - Choose between Claude Agent SDK (containerized), Codex CLI (lightweight), or OpenCode CLI (session-aware)
+- **Flexible Container Runtimes** - Apple Container (lightweight), Docker (cross-platform), Tart (VM one-time security), or Vibe (persistent Linux VM)
+- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own sandbox with only that filesystem mounted
 - **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content
-- **Container isolation** - Agents sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
+- **Container isolation** - Agents sandboxed in Apple Container, Docker, Tart VMs, or Vibe VMs
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks (first personal AI assistant to support this)
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 

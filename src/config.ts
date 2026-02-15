@@ -38,6 +38,23 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   10,
 ); // 10MB default
 export const IPC_POLL_INTERVAL = 1000;
+
+// Tart VM configuration
+export const TART_BASE_IMAGE = process.env.TART_BASE_IMAGE || 'tart_nanoclaw_base';
+export const TART_VM_USERNAME = process.env.TART_VM_USERNAME || 'admin';
+export const TART_VM_PASSWORD = process.env.TART_VM_PASSWORD || 'admin';
+export const TART_SSH_TIMEOUT = parseInt(process.env.TART_SSH_TIMEOUT || '60000', 10);
+
+// Vibe VM configuration
+export const VIBE_BASE_IMAGE = process.env.VIBE_BASE_IMAGE || 'base.raw';
+export const VIBE_IMAGES_DIR = process.env.VIBE_IMAGES_DIR || path.join(DATA_DIR, 'vibe-images');
+export const VIBE_CPUS = parseInt(process.env.VIBE_CPUS || '2', 10);
+export const VIBE_RAM = parseInt(process.env.VIBE_RAM || '2048', 10);
+export const VIBE_TIMEOUT = parseInt(process.env.VIBE_TIMEOUT || '300000', 10);
+
+// OpenCode configuration
+export const OPENCODE_MODEL = process.env.OPENCODE_MODEL || 'github-copilot/gpt-4o';
+
 export const IDLE_TIMEOUT = parseInt(
   process.env.IDLE_TIMEOUT || '1800000',
   10,
@@ -48,8 +65,11 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
 );
 
 // Agent runtime selection
-export type AgentRuntime = 'claude' | 'codex';
-export const AGENT_RUNTIME: AgentRuntime = (process.env.AGENT_RUNTIME === 'codex') ? 'codex' : 'claude';
+export type AgentRuntime = 'claude' | 'codex' | 'opencode';
+export const AGENT_RUNTIME: AgentRuntime =
+  (process.env.AGENT_RUNTIME === 'codex') ? 'codex' :
+  (process.env.AGENT_RUNTIME === 'opencode') ? 'opencode' :
+  'claude';
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -59,6 +79,10 @@ export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
 );
+
+// Whether to require the trigger pattern (@Name) for non-main groups
+// Default to false for personal bots (respond to everything)
+export const REQUIRE_TRIGGER = process.env.REQUIRE_TRIGGER === 'true';
 
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default

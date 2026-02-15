@@ -72,6 +72,11 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -228,6 +233,28 @@ export function storeMessageDirect(msg: {
     msg.content,
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
+  );
+}
+
+export function storeDiscordMessage(msg: {
+  id: string;
+  chatJid: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  timestamp: string;
+  isFromMe: boolean;
+}): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    msg.id,
+    msg.chatJid,
+    msg.senderId,
+    msg.senderName,
+    msg.content,
+    msg.timestamp,
+    msg.isFromMe ? 1 : 0,
   );
 }
 
@@ -526,6 +553,21 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Settings accessors (Hot-swappable configuration) ---
+
+export function getSetting(key: string): string | undefined {
+  const row = db
+    .prepare('SELECT value FROM settings WHERE key = ?')
+    .get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setSetting(key: string, value: string): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+  ).run(key, value);
 }
 
 // --- JSON migration ---

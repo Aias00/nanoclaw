@@ -5,15 +5,19 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  DISCORD_MAIN_CHANNEL_ID,
+  DISCORD_TOKEN,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  REQUIRE_TRIGGER,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
+import { startDiscord, sendDiscordMessage, setDiscordTyping, DiscordIncomingMessage } from './discord.js';
 import {
   ContainerOutput,
-  runContainerAgent,
+  runAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -30,11 +34,14 @@ import {
   setRouterState,
   setSession,
   storeChatMetadata,
+  storeDiscordMessage,
   storeMessage,
+  getSetting,
+  setSetting,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
-import { formatMessages, formatOutbound } from './router.js';
+import { escapeXml, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -51,6 +58,15 @@ let messageLoopRunning = false;
 let whatsapp: WhatsAppChannel;
 const queue = new GroupQueue();
 
+// Hardcoded group for Discord interactions (for now)
+const DISCORD_GROUP: RegisteredGroup = {
+  name: 'Discord',
+  folder: 'discord',
+  trigger: '.*',
+  added_at: new Date().toISOString(),
+  requiresTrigger: false,
+};
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -62,6 +78,12 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+
+  // Ensure Discord group is registered
+  if (!registeredGroups['discord']) {
+    registerGroup('discord', DISCORD_GROUP);
+  }
+
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -133,7 +155,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (missedMessages.length === 0) return true;
 
   // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  // REQUIRE_TRIGGER config controls whether we enforce @Name mentions
+  if (!isMainGroup && REQUIRE_TRIGGER && group.requiresTrigger !== false) {
     const hasTrigger = missedMessages.some((m) =>
       TRIGGER_PATTERN.test(m.content.trim()),
     );
@@ -168,53 +191,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await whatsapp.setTyping(chatJid, true);
   let hadError = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await whatsapp.sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
-      }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
-
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
-
-  await whatsapp.setTyping(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
-
-  if (output === 'error' || hadError) {
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
-    return false;
-  }
-
-  return true;
-}
-
-async function runAgent(
-  group: RegisteredGroup,
-  prompt: string,
-  chatJid: string,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
+  // Update session tracking
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
   writeTasksSnapshot(
     group.folder,
-    isMain,
+    isMainGroup,
     tasks.map((t) => ({
       id: t.id,
       groupFolder: t.group_folder,
@@ -230,34 +214,48 @@ async function runAgent(
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
     group.folder,
-    isMain,
+    isMainGroup,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
-
   try {
-    const output = await runContainerAgent(
+    const output = await runAgent(
       group,
       {
         prompt,
         sessionId,
         groupFolder: group.folder,
         chatJid,
-        isMain,
+        isMain: isMainGroup,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
+      async (result) => {
+        // Streaming output callback — called for each agent result
+        if (result.newSessionId) {
+          sessions[group.folder] = result.newSessionId;
+          setSession(group.folder, result.newSessionId);
+        }
+
+        if (result.result) {
+          const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+          // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+          const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+          logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+          if (text) {
+            // Send raw text without "AssistantName:" prefix
+            await whatsapp.sendMessage(chatJid, text);
+            // Save state immediately after sending to prevent re-sending on crash
+            saveState();
+          }
+          // Only reset idle timer on actual results, not session-update markers (result: null)
+          resetIdleTimer();
+        }
+
+        if (result.status === 'error') {
+          hadError = true;
+        }
+      }
     );
 
     if (output.newSessionId) {
@@ -266,18 +264,142 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      return 'error';
+      hadError = true;
+    }
+  } catch (err) {
+    logger.error({ group: group.name, err }, 'Agent execution error');
+    hadError = true;
+  }
+
+  await whatsapp.setTyping(chatJid, false);
+  if (idleTimer) clearTimeout(idleTimer);
+
+  if (hadError) {
+    // Roll back cursor so retries can re-process these messages
+    lastAgentTimestamp[chatJid] = previousCursor;
+    saveState();
+    logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
+    return false;
+  }
+
+  return true;
+}
+
+// Discord message handler
+async function processDiscordIncoming(msg: DiscordIncomingMessage): Promise<void> {
+  // Handle admin commands (hot-swappable settings)
+  const commandMatch = msg.content.match(/^!runtime\s+(claude|codex|opencode|status)$/i);
+  if (commandMatch) {
+    const cmd = commandMatch[1].toLowerCase();
+    if (cmd === 'status') {
+      const current = getSetting('agent_runtime') || 'claude (default)';
+      await sendDiscordMessage(msg.scopeId, `🔧 Current runtime: **${current}**`);
+    } else {
+      setSetting('agent_runtime', cmd);
+      logger.info({ runtime: cmd, user: msg.authorName }, 'Runtime switched via command');
+      await sendDiscordMessage(msg.scopeId, `✅ Runtime switched to **${cmd}**. Next message will use it.`);
+    }
+    return; // Don't process as normal message
+  }
+
+  // Persist chat + message
+  storeChatMetadata(msg.scopeId, msg.timestamp, msg.channelName ? `discord:${msg.channelName}` : msg.scopeId);
+  storeDiscordMessage({
+    id: msg.id,
+    chatJid: msg.scopeId,
+    senderId: msg.authorId,
+    senderName: msg.authorName,
+    content: msg.content,
+    timestamp: msg.timestamp,
+    isFromMe: false
+  });
+
+  // Respond to all messages in allowed channels (no @mention required)
+  // The isAllowed check in discord.ts already filters to main channel + allowlisted channels
+  const shouldRespond = true;
+  if (!shouldRespond) return;
+
+  const sinceTimestamp = lastAgentTimestamp[msg.scopeId] || '';
+  const prompt = buildPromptFromMessages(msg.scopeId, sinceTimestamp);
+  if (!prompt) return;
+
+  const isMain = msg.isMainChannel;
+
+  logger.info({ scopeId: msg.scopeId, isMain, isDM: msg.isDM }, 'Processing Discord message');
+
+  await setDiscordTyping(msg.scopeId, true);
+
+  // Ensure Discord group is registered
+  if (!registeredGroups['discord']) {
+    registerGroup('discord', DISCORD_GROUP);
+  }
+
+  const group = registeredGroups['discord'];
+  const sessionId = sessions[group.folder];
+
+  // Update snapshots
+  const tasks = getAllTasks();
+  writeTasksSnapshot(
+    group.folder,
+    false, // Discord group is not "main" in terms of whatsapp management
+    tasks.map((t) => ({
+      id: t.id,
+      groupFolder: t.group_folder,
+      prompt: t.prompt,
+      schedule_type: t.schedule_type,
+      schedule_value: t.schedule_value,
+      status: t.status,
+      next_run: t.next_run,
+    })),
+  );
+
+  try {
+    const output = await runAgent(
+      group,
+      {
+        prompt,
+        sessionId,
+        groupFolder: group.folder,
+        chatJid: msg.scopeId,
+        isMain: false,
+      },
+      (proc, containerName) => {
+        // No queue management for Discord yet
+      }
+    );
+
+    await setDiscordTyping(msg.scopeId, false);
+
+    if (output.newSessionId) {
+      sessions[group.folder] = output.newSessionId;
+      setSession(group.folder, output.newSessionId);
     }
 
-    return 'success';
+    if (output.result) {
+      lastAgentTimestamp[msg.scopeId] = msg.timestamp;
+      saveState(); // Save state immediately
+      // Send raw response without prefix
+      await sendDiscordMessage(msg.scopeId, output.result);
+    }
   } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
+    logger.error({ err }, 'Error processing Discord message');
+    await setDiscordTyping(msg.scopeId, false);
   }
+}
+
+function buildPromptFromMessages(chatJid: string, sinceTimestamp: string): string {
+  const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+
+  const lines = missedMessages.map(m => {
+    const escapeXml = (s: string) => s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
+  });
+
+  return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -321,7 +443,9 @@ async function startMessageLoop(): Promise<void> {
           if (!group) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+
+          // Check REQUIRE_TRIGGER for non-main groups
+          const needsTrigger = !isMainGroup && REQUIRE_TRIGGER && group.requiresTrigger !== false;
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
@@ -384,6 +508,24 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
+  // Only check Apple Container if we are using it
+  // Docker, Tart, and Vibe don't use 'container' command
+  // But we still need to check if 'container' command exists first to avoid error
+  const containerRuntime = process.env.CONTAINER_RUNTIME;
+  if (containerRuntime === 'docker' || containerRuntime === 'tart' || containerRuntime === 'vibe') {
+    logger.info({ runtime: containerRuntime }, 'Using alternative runtime, skipping Apple Container check');
+    return;
+  }
+
+  // Auto-detection logic: if 'container' command exists, use it.
+  try {
+    execSync('which container', { stdio: 'ignore' });
+  } catch {
+    // container command not found, probably using Docker as fallback
+    logger.info('Apple Container (container) not found, assuming Docker usage');
+    return;
+  }
+
   try {
     execSync('container system status', { stdio: 'pipe' });
     logger.debug('Apple Container system already running');
@@ -393,55 +535,8 @@ function ensureContainerSystemRunning(): void {
       execSync('container system start', { stdio: 'pipe', timeout: 30000 });
       logger.info('Apple Container system started');
     } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
+      logger.warn({ err }, 'Failed to start Apple Container system (may fallback to Docker)');
     }
-  }
-
-  // Kill and clean up orphaned NanoClaw containers from previous runs
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
-    const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
-      } catch { /* already stopped */ }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
   }
 }
 
@@ -455,7 +550,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
-    await whatsapp.disconnect();
+    if (whatsapp) await whatsapp.disconnect();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -468,8 +563,23 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
   });
 
-  // Connect — resolves when first connected
-  await whatsapp.connect();
+  // Connect WhatsApp — resolves when first connected
+  // Note: We don't block on this anymore to allow Discord-only operation
+  whatsapp.connect().catch(err => {
+    logger.warn({ err }, 'WhatsApp connection failed (continuing with other channels)');
+  });
+
+  // Connect Discord
+  if (DISCORD_TOKEN) {
+    try {
+      await startDiscord({
+        onIncomingMessage: processDiscordIncoming,
+        logger
+      });
+    } catch (err) {
+      logger.error({ err }, 'Discord connection failed (continuing with other channels)');
+    }
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
